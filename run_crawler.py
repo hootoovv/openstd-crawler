@@ -30,6 +30,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'standards.db')
 
 
+def _table_exists(cur, table_name):
+    """检查表是否存在"""
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+    return cur.fetchone() is not None
+
+
 def show_stats():
     import sqlite3
     if not os.path.exists(DB_PATH):
@@ -39,47 +45,64 @@ def show_stats():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
+    gb_total = 0
+    gb_downloaded = 0
+    hb_total = 0
+    hb_downloaded = 0
+
+    # 国家标准统计
     print("\n===== 国家标准统计 =====")
-    cur.execute('SELECT COUNT(*) FROM gb_standards')
-    gb_total = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM gb_standards WHERE local_file != '' AND local_file IS NOT NULL")
-    gb_downloaded = cur.fetchone()[0]
+    if _table_exists(cur, 'gb_standards'):
+        cur.execute('SELECT COUNT(*) FROM gb_standards')
+        gb_total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM gb_standards WHERE local_file != '' AND local_file IS NOT NULL")
+        gb_downloaded = cur.fetchone()[0]
 
-    types = {'强制性国家标准': 1, '推荐性国家标准': 2, '指导性技术文件': 3}
-    for name, code in types.items():
-        cur.execute('SELECT COUNT(*) FROM gb_standards WHERE std_type = ?', (name,))
-        count = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM gb_standards WHERE std_type = ? AND local_file != '' AND local_file IS NOT NULL", (name,))
-        dl = cur.fetchone()[0]
-        print(f"  {name}: {count} 条, 已下载 {dl}")
+        types = {'强制性国家标准': 1, '推荐性国家标准': 2, '指导性技术文件': 3}
+        for name, code in types.items():
+            cur.execute('SELECT COUNT(*) FROM gb_standards WHERE std_type = ?', (name,))
+            count = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM gb_standards WHERE std_type = ? AND local_file != '' AND local_file IS NOT NULL", (name,))
+            dl = cur.fetchone()[0]
+            print(f"  {name}: {count} 条, 已下载 {dl}")
 
-    cur.execute('SELECT std_type_code, COUNT(*) FROM gb_crawl_progress WHERE status = "done" GROUP BY std_type_code')
-    for code, pages in cur.fetchall():
-        name = {1: '强制性', 2: '推荐性', 3: '指导性'}.get(code, str(code))
-        print(f"  {name}已爬取页数: {pages}")
+        if _table_exists(cur, 'gb_crawl_progress'):
+            cur.execute('SELECT std_type_code, COUNT(*) FROM gb_crawl_progress WHERE status = "done" GROUP BY std_type_code')
+            for code, pages in cur.fetchall():
+                name = {1: '强制性', 2: '推荐性', 3: '指导性'}.get(code, str(code))
+                print(f"  {name}已爬取页数: {pages}")
 
-    print(f"  国家标准总计: {gb_total} 条, 已下载: {gb_downloaded}")
+        print(f"  国家标准总计: {gb_total} 条, 已下载: {gb_downloaded}")
+    else:
+        print("  尚未爬取国家标准数据")
 
+    # 行业标准统计
     print("\n===== 行业标准统计 =====")
-    cur.execute('SELECT COUNT(*) FROM hb_standards')
-    hb_total = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM hb_standards WHERE local_file != '' AND local_file IS NOT NULL")
-    hb_downloaded = cur.fetchone()[0]
+    if _table_exists(cur, 'hb_standards'):
+        cur.execute('SELECT COUNT(*) FROM hb_standards')
+        hb_total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM hb_standards WHERE local_file != '' AND local_file IS NOT NULL")
+        hb_downloaded = cur.fetchone()[0]
 
-    cur.execute('SELECT industry, COUNT(*) as cnt FROM hb_standards GROUP BY industry ORDER BY cnt DESC LIMIT 10')
-    print("  行业分布(Top 10):")
-    for industry, cnt in cur.fetchall():
-        print(f"    {industry or '未知'}: {cnt} 条")
+        cur.execute('SELECT industry, COUNT(*) as cnt FROM hb_standards GROUP BY industry ORDER BY cnt DESC LIMIT 10')
+        print("  行业分布(Top 10):")
+        for industry, cnt in cur.fetchall():
+            print(f"    {industry or '未知'}: {cnt} 条")
 
-    cur.execute('SELECT status, COUNT(*) FROM hb_download_progress GROUP BY status')
-    print("  下载状态:")
-    for status, cnt in cur.fetchall():
-        print(f"    {status}: {cnt}")
+        if _table_exists(cur, 'hb_download_progress'):
+            cur.execute('SELECT status, COUNT(*) FROM hb_download_progress GROUP BY status')
+            print("  下载状态:")
+            for status, cnt in cur.fetchall():
+                print(f"    {status}: {cnt}")
 
-    cur.execute('SELECT COUNT(*) FROM hb_crawl_progress WHERE status = "done"')
-    hb_pages = cur.fetchone()[0]
-    print(f"  已爬取页数: {hb_pages}")
-    print(f"  行业标准总计: {hb_total} 条, 已下载: {hb_downloaded}")
+        if _table_exists(cur, 'hb_crawl_progress'):
+            cur.execute('SELECT COUNT(*) FROM hb_crawl_progress WHERE status = "done"')
+            hb_pages = cur.fetchone()[0]
+            print(f"  已爬取页数: {hb_pages}")
+
+        print(f"  行业标准总计: {hb_total} 条, 已下载: {hb_downloaded}")
+    else:
+        print("  尚未爬取行业标准数据")
 
     print(f"\n===== 总计 =====")
     print(f"  标准: {gb_total + hb_total} 条, 已下载PDF: {gb_downloaded + hb_downloaded} 个")
@@ -111,35 +134,48 @@ def main():
         parser.print_help()
         return
 
-    if args.target in ['gb', 'all']:
-        print("\n" + "="*60)
-        print("  国家标准爬虫")
-        print("="*60)
-        from gb_crawler import GBCrawler
-        crawler = GBCrawler()
-        try:
-            if do_crawl:
-                crawler.crawl_list(args.type)
-            if do_download:
-                crawler.download_all()
-        finally:
-            crawler.close()
+    gb_crawler = None
+    hb_crawler = None
 
-    if args.target in ['hb', 'all']:
-        print("\n" + "="*60)
-        print("  行业标准爬虫")
-        print("="*60)
-        from hb_crawler import HBCrawler
-        crawler = HBCrawler()
-        try:
+    try:
+        if args.target in ['gb', 'all']:
+            print("\n" + "="*60)
+            print("  国家标准爬虫")
+            print("="*60)
+            from gb_crawler import GBCrawler
+            gb_crawler = GBCrawler()
             if do_crawl:
-                crawler.crawl_list()
+                gb_crawler.crawl_list(args.type)
             if do_download:
-                crawler.download_all()
-        finally:
-            crawler.close()
+                gb_crawler.download_all()
 
-    show_stats()
+        if args.target in ['hb', 'all']:
+            print("\n" + "="*60)
+            print("  行业标准爬虫")
+            print("="*60)
+            from hb_crawler import HBCrawler
+            hb_crawler = HBCrawler()
+            if do_crawl:
+                hb_crawler.crawl_list()
+            if do_download:
+                hb_crawler.download_all()
+
+        show_stats()
+
+    except KeyboardInterrupt:
+        if gb_crawler:
+            gb_crawler.request_stop()
+        if hb_crawler:
+            hb_crawler.request_stop()
+        print("\n")
+        print("  ⏹  收到 Ctrl+C 中断信号")
+        print("  💾 已保存所有爬取和下载进度")
+        print("  🔄 下次运行将从断点处继续")
+    finally:
+        if gb_crawler:
+            gb_crawler.close()
+        if hb_crawler:
+            hb_crawler.close()
 
 
 if __name__ == '__main__':

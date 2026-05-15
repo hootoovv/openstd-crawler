@@ -220,6 +220,11 @@ class Database:
         self.conn.close()
 
 
+class CrawlInterrupted(Exception):
+    """用户中断爬虫时抛出的异常"""
+    pass
+
+
 class HBCrawler:
     """行业标准爬虫"""
 
@@ -237,8 +242,11 @@ class HBCrawler:
             'Referer': BASE_URL + '/stdList',
             'X-Requested-With': 'XMLHttpRequest',
         })
+        self._interrupted = False
 
     def _delay(self):
+        if self._interrupted:
+            raise CrawlInterrupted()
         time.sleep(random.uniform(*REQUEST_DELAY))
 
     def _fetch_list_page(self, page_num):
@@ -305,40 +313,48 @@ class HBCrawler:
     def crawl_list(self):
         logger.info("===== 开始爬取行业标准列表 =====")
 
-        result = self._fetch_list_page(1)
-        if not result:
-            logger.error("无法获取行业标准第一页")
-            return
-
-        records, total_pages = self._parse_records(result, 1)
-        total_records = result.get('total', 0)
-        logger.info(f"行业标准共 {total_pages} 页 (每页 {PAGE_SIZE} 条, 总计 {total_records} 条)")
-
-        crawled_pages = self.db.get_crawled_pages()
-        logger.info(f"已爬取 {len(crawled_pages)} 页")
-
-        if 1 not in crawled_pages:
-            for record in records:
-                self.db.insert_standard(record)
-            self.db.mark_page_done(1, total_pages)
-            logger.info(f"第 1/{total_pages} 页: 爬取 {len(records)} 条记录")
-
-        for page in range(2, total_pages + 1):
-            if page in crawled_pages:
-                continue
-
-            result = self._fetch_list_page(page)
+        try:
+            result = self._fetch_list_page(1)
             if not result:
-                logger.error(f"第 {page}/{total_pages} 页获取失败")
-                continue
+                logger.error("无法获取行业标准第一页")
+                return
 
-            records, _ = self._parse_records(result, page)
-            for record in records:
-                self.db.insert_standard(record)
-            self.db.mark_page_done(page, total_pages)
-            logger.info(f"第 {page}/{total_pages} 页: 爬取 {len(records)} 条记录")
+            records, total_pages = self._parse_records(result, 1)
+            total_records = result.get('total', 0)
+            logger.info(f"行业标准共 {total_pages} 页 (每页 {PAGE_SIZE} 条, 总计 {total_records} 条)")
 
-        logger.info("===== 行业标准列表爬取完成 =====")
+            crawled_pages = self.db.get_crawled_pages()
+            logger.info(f"已爬取 {len(crawled_pages)} 页")
+
+            if 1 not in crawled_pages:
+                for record in records:
+                    self.db.insert_standard(record)
+                self.db.mark_page_done(1, total_pages)
+                logger.info(f"第 1/{total_pages} 页: 爬取 {len(records)} 条记录")
+
+            for page in range(2, total_pages + 1):
+                if self._interrupted:
+                    logger.info("检测到中断信号，停止爬取行业标准")
+                    break
+                if page in crawled_pages:
+                    continue
+
+                result = self._fetch_list_page(page)
+                if not result:
+                    logger.error(f"第 {page}/{total_pages} 页获取失败")
+                    continue
+
+                records, _ = self._parse_records(result, page)
+                for record in records:
+                    self.db.insert_standard(record)
+                self.db.mark_page_done(page, total_pages)
+                logger.info(f"第 {page}/{total_pages} 页: 爬取 {len(records)} 条记录")
+
+        except CrawlInterrupted:
+            logger.info("用户中断爬取行业标准，已保存进度")
+
+        if not self._interrupted:
+            logger.info("===== 行业标准列表爬取完成 =====")
         self.db.get_stats()
 
     def _safe_filename(self, standard_no, standard_name):
@@ -500,8 +516,13 @@ class HBCrawler:
         skipped = 0
         not_public = 0
         no_file = 0
+        interrupted = False
 
         for i, row in enumerate(pending):
+            if self._interrupted:
+                interrupted = True
+                break
+
             standard_no = row[0]
             pk = row[1]
 
@@ -527,7 +548,13 @@ class HBCrawler:
 
             logger.info(f"下载进度: {i+1}/{total} - {standard_no} {standard_name[:30]}")
 
-            result = self.download_pdf(pk, standard_no, standard_name)
+            try:
+                result = self.download_pdf(pk, standard_no, standard_name)
+            except CrawlInterrupted:
+                logger.info("用户中断下载，已保存进度")
+                interrupted = True
+                break
+
             if result == 'success':
                 success += 1
                 self.db.mark_download_status(standard_no, pk, 'success')
@@ -542,7 +569,15 @@ class HBCrawler:
             if (i + 1) % 50 == 0:
                 logger.info(f"=== 进度: {i+1}/{total}, 成功={success}, 失败={failed}, 未公开={not_public}, 无文件={no_file}, 跳过={skipped} ===")
 
-        logger.info(f"下载完成: 成功 {success}, 失败 {failed}, 未公开 {not_public}, 无文件 {no_file}, 跳过 {skipped}")
+        if interrupted:
+            logger.info(f"下载已中断: 成功 {success}, 失败 {failed}, 未公开 {not_public}, 无文件 {no_file}, 跳过 {skipped} (剩余 {total - success - failed - not_public - no_file - skipped} 个待下载)")
+        else:
+            logger.info(f"下载完成: 成功 {success}, 失败 {failed}, 未公开 {not_public}, 无文件 {no_file}, 跳过 {skipped}")
+
+    def request_stop(self):
+        """请求优雅停止，会在当前任务完成后退出"""
+        self._interrupted = True
+        logger.info("已收到停止请求，等待当前任务完成...")
 
     def close(self):
         self.db.close()
@@ -570,6 +605,12 @@ def main():
             crawler.download_all()
         else:
             parser.print_help()
+    except KeyboardInterrupt:
+        crawler.request_stop()
+        print("\n")
+        print("  ⏹  收到 Ctrl+C 中断信号")
+        print("  💾 已保存所有爬取和下载进度")
+        print("  🔄 下次运行将从断点处继续")
     finally:
         crawler.close()
 
