@@ -1,0 +1,59 @@
+[project]
+name = "standards-crawler"
+version = "1.0.0"
+description = "中国国家标准与行业标准全量数据爬取及PDF下载工具，支持断点续爬、验证码自动识别"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Standards Crawler Team" },
+]
+keywords = ["crawler", "standards", "gb", "hb", "pdf", "captcha"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    "ddddocr>=1.5.0",
+]
+
+[project.optional-dependencies]
+playwright = [
+    "playwright>=1.40.0",
+]
+dev = [
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+standards-crawler = "run_crawler:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scripts"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.4.0",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
