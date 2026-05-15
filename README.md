@@ -326,3 +326,6 @@ uv run python run_crawler.py stats
 ## 许可证
 
 本项目仅供学习和研究使用，请遵守相关网站的使用条款和 robots.txt 规则。爬取数据时请注意控制请求频率，避免对目标服务器造成过大压力。
+
+提示及测试： hootoovv
+设计及实现：GLM5.1 Agent @ https://chat.z.ai/ 
