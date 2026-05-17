@@ -6,7 +6,8 @@
 用法:
   python run_crawler.py gb --crawl          # 爬取国家标准列表
   python run_crawler.py gb --crawl --type 1 # 只爬取强制性国家标准
-  python run_crawler.py gb --download       # 下载国家标准PDF
+  python run_crawler.py gb --download       # 下载国家标准PDF（默认仅可下载标准）
+  python run_crawler.py gb --download --include-preview  # 下载国家标准PDF（含仅可预览标准）
   python run_crawler.py gb --all            # 爬取+下载国家标准
 
   python run_crawler.py hb --crawl          # 爬取行业标准列表
@@ -119,6 +120,8 @@ def main():
     parser.add_argument('--download', action='store_true', help='下载标准PDF')
     parser.add_argument('--type', type=int, choices=[1, 2, 3],
                        help='国家标准类型: 1=强制性, 2=推荐性, 3=指导性')
+    parser.add_argument('--include-preview', action='store_true',
+                       help='下载国标时包含仅可预览的标准（默认仅下载可直接下载的标准）')
     parser.add_argument('--all', action='store_true', help='执行全部操作（爬取+下载）')
     args = parser.parse_args()
 
@@ -147,7 +150,7 @@ def main():
             if do_crawl:
                 gb_crawler.crawl_list(args.type)
             if do_download:
-                gb_crawler.download_all()
+                gb_crawler.download_all(include_preview=args.include_preview)
 
         if args.target in ['hb', 'all']:
             print("\n" + "="*60)

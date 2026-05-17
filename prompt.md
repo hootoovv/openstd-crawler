@@ -27,3 +27,10 @@ https://hbba.sacinfo.org.cn/stdList
 
 行业标准的下载可以正常进行。但国标下载总是失败。请重新研究国标下载的页面，找到正确的下载方法。例如在国标详情页：https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=F561312CBB6D7CF605717F125EDBFBF5 中，点击下载标准时会提示输出验证码，当正确输出验证码后国标pdf文件可以正常下载。所以，请找到正确的下载方法，然后修改相关代码。 
 
+判断国标是否可预览或下载不准确。如：https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=AAF1CD9403AC05FC861DFE522A9D5C7C 页面上存在在线预览和下载标准的按钮，但程序未检出。 
+
+国标的预览方式下载全部失败。将检查所使用方法。
+
+添加下载选项，默认只下载可下载国标。
+
+更新readme文档后，将项目重新打包成zip输出

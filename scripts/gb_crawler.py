@@ -6,7 +6,7 @@
 
 下载流程:
 1. 爬取标准列表，获取 hcno（标准唯一标识）
-2. 访问详情页，判断标准是否允许下载/预览
+2. 访问详情页，判断标准是否允许下载/预览（可用性检测）
 3. 获取验证码图片 (c.gb688.cn/bzgk/gb/gc)
 4. 使用 ddddocr + cv2 预处理识别验证码
 5. 提交验证码验证 (c.gb688.cn/bzgk/gb/verifyCode)
@@ -14,9 +14,11 @@
 
 用法:
   python gb_crawler.py --crawl          # 爬取标准列表
-  python gb_crawler.py --download       # 下载标准PDF
+  python gb_crawler.py --check          # 检测标准可用性（下载/预览权限）
+  python gb_crawler.py --download       # 下载标准PDF（默认仅下载可下载标准）
+  python gb_crawler.py --download --include-preview  # 下载标准PDF（包含仅可预览标准）
   python gb_crawler.py --type 1         # 只爬取强制性国家标准
-  python gb_crawler.py --all            # 爬取+下载
+  python gb_crawler.py --all            # 爬取+检测+下载
   python gb_crawler.py --stats          # 显示统计信息
 """
 
@@ -59,6 +61,7 @@ STD_TYPES = {
 
 PAGE_SIZE = 50
 REQUEST_DELAY = (1, 3)
+CHECK_DELAY = (0.5, 1.5)
 MAX_RETRIES = 3
 CAPTCHA_MAX_RETRIES = 10
 DOWNLOAD_MAX_RETRIES = 5
@@ -122,6 +125,7 @@ class Database:
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self._create_tables()
+        self._migrate_tables()
 
     def _create_tables(self):
         cursor = self.conn.cursor()
@@ -139,6 +143,7 @@ class Database:
                 hcno TEXT DEFAULT '',
                 allow_download INTEGER DEFAULT 0,
                 allow_preview INTEGER DEFAULT 0,
+                allow_checked INTEGER DEFAULT 0,
                 local_file TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -168,6 +173,17 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_gb_status ON gb_standards(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_gb_hcno ON gb_standards(hcno)')
         self.conn.commit()
+
+    def _migrate_tables(self):
+        """数据库迁移：为已有表添加新列"""
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute('ALTER TABLE gb_standards ADD COLUMN allow_checked INTEGER DEFAULT 0')
+            self.conn.commit()
+            logger.info("数据库迁移: 添加 allow_checked 列")
+        except sqlite3.OperationalError:
+            # 列已存在，无需迁移
+            pass
 
     def insert_standard(self, data):
         cursor = self.conn.cursor()
@@ -205,6 +221,62 @@ class Database:
                        (allow_download, allow_preview, standard_no))
         self.conn.commit()
 
+    def update_allow_checked(self, standard_no):
+        """标记标准已完成可用性检测"""
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE gb_standards SET allow_checked = 1 WHERE standard_no = ?', (standard_no,))
+        self.conn.commit()
+
+    def get_unchecked_standards(self, std_type=None):
+        """获取未检测可用性的标准列表
+
+        Args:
+            std_type: 标准类型名称（可选），如 "强制性国家标准"
+
+        Returns:
+            list[sqlite3.Row]: allow_checked=0 且 hcno 不为空的标准列表
+        """
+        cursor = self.conn.cursor()
+        if std_type:
+            cursor.execute('''
+                SELECT standard_no, hcno FROM gb_standards
+                WHERE allow_checked = 0 AND hcno != '' AND std_type = ?
+            ''', (std_type,))
+        else:
+            cursor.execute('''
+                SELECT standard_no, hcno FROM gb_standards
+                WHERE allow_checked = 0 AND hcno != ''
+            ''')
+        return cursor.fetchall()
+
+    def get_downloadable_standards(self, include_preview=False):
+        """获取可下载但尚未下载的标准列表
+
+        Args:
+            include_preview: 是否包含仅允许预览的标准。
+                False(默认): 仅返回 allow_download=1 的标准
+                True: 返回 allow_download=1 或 allow_preview=1 的标准
+
+        Returns:
+            list[sqlite3.Row]: 包含 standard_no, hcno, allow_download, allow_preview 字段
+        """
+        cursor = self.conn.cursor()
+        if include_preview:
+            cursor.execute('''
+                SELECT standard_no, hcno, allow_download, allow_preview FROM gb_standards
+                WHERE (allow_download = 1 OR allow_preview = 1)
+                  AND (local_file = '' OR local_file IS NULL)
+                  AND hcno != ''
+            ''')
+        else:
+            cursor.execute('''
+                SELECT standard_no, hcno, allow_download, allow_preview FROM gb_standards
+                WHERE allow_download = 1
+                  AND (local_file = '' OR local_file IS NULL)
+                  AND hcno != ''
+            ''')
+        return cursor.fetchall()
+
     def get_crawled_pages(self, std_type_code):
         cursor = self.conn.cursor()
         cursor.execute('SELECT page_number FROM gb_crawl_progress WHERE std_type_code = ? AND status = ?', (std_type_code, 'done'))
@@ -219,12 +291,27 @@ class Database:
         ''', (std_type_code, page_number, total_pages, total_pages))
         self.conn.commit()
 
-    def get_pending_downloads(self):
+    def get_pending_downloads(self, include_preview=False):
+        """获取待下载的标准列表
+
+        Args:
+            include_preview: 是否包含仅允许预览的标准
+        """
         cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT standard_no, hcno FROM gb_standards
-            WHERE (local_file = '' OR local_file IS NULL) AND hcno != ''
-        ''')
+        if include_preview:
+            cursor.execute('''
+                SELECT standard_no, hcno FROM gb_standards
+                WHERE (allow_download = 1 OR allow_preview = 1)
+                  AND (local_file = '' OR local_file IS NULL)
+                  AND hcno != ''
+            ''')
+        else:
+            cursor.execute('''
+                SELECT standard_no, hcno FROM gb_standards
+                WHERE allow_download = 1
+                  AND (local_file = '' OR local_file IS NULL)
+                  AND hcno != ''
+            ''')
         return cursor.fetchall()
 
     def mark_download_status(self, standard_no, hcno, status, retries=0):
@@ -248,12 +335,24 @@ class Database:
         total = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM gb_standards WHERE local_file != '' AND local_file IS NOT NULL")
         downloaded = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM gb_standards WHERE allow_checked = 1')
+        checked = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM gb_standards WHERE allow_download = 1')
+        downloadable = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM gb_standards WHERE allow_preview = 1')
+        previewable = cursor.fetchone()[0]
+        logger.info(f"  总计: {total} 条, 已下载 {downloaded}, 已检测 {checked}, "
+                     f"可下载 {downloadable}, 可预览 {previewable}")
         for code in [1, 2, 3]:
             cursor.execute('SELECT COUNT(*) FROM gb_standards WHERE std_type = ?', (STD_TYPES[code],))
             count = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM gb_standards WHERE std_type = ? AND local_file != '' AND local_file IS NOT NULL", (STD_TYPES[code],))
             dl = cursor.fetchone()[0]
-            logger.info(f"  {STD_TYPES[code]}: {count} 条, 已下载 {dl}")
+            cursor.execute('SELECT COUNT(*) FROM gb_standards WHERE std_type = ? AND allow_download = 1', (STD_TYPES[code],))
+            dl_count = cursor.fetchone()[0]
+            cursor.execute('SELECT COUNT(*) FROM gb_standards WHERE std_type = ? AND allow_preview = 1', (STD_TYPES[code],))
+            pv_count = cursor.fetchone()[0]
+            logger.info(f"  {STD_TYPES[code]}: {count} 条, 已下载 {dl}, 可下载 {dl_count}, 可预览 {pv_count}")
         return total, downloaded
 
     def close(self):
@@ -314,6 +413,14 @@ class GBCrawler:
         if self._interrupted:
             raise CrawlInterrupted()
         time.sleep(random.uniform(*REQUEST_DELAY))
+
+    def _check_delay(self):
+        """可用性检测的延迟（比爬取延迟短）"""
+        if self._interrupted:
+            raise CrawlInterrupted()
+        time.sleep(random.uniform(*CHECK_DELAY))
+
+    # ==================== 列表爬取 ====================
 
     def _fetch_page(self, std_type_code, page_num):
         params = {
@@ -461,6 +568,117 @@ class GBCrawler:
         total, downloaded = self.db.get_stats()
         logger.info(f"数据库中共有 {total} 条国家标准记录, 已下载 {downloaded} 个文件")
 
+    # ==================== 可用性检测 ====================
+
+    def _check_detail_availability(self, hcno):
+        """检测单个标准的详情页可用性（下载/预览权限）
+
+        通过访问 openstd.samr.gov.cn 的详情页，检查页面上的按钮来判断：
+        - class='ck_btn' 的 button: 在线预览按钮
+        - class='xz_btn' 的 button: 下载按钮
+
+        注意：不能使用 '系统尚未收录' 字符串匹配，因为该文本出现在每个页面的
+        JavaScript i18n 对象中，无论标准是否被收录都会存在。
+
+        Args:
+            hcno: 标准唯一标识哈希
+
+        Returns:
+            tuple[int, int]: (allow_download, allow_preview) 1=允许, 0=不允许
+        """
+        try:
+            resp = self.session.get(
+                DETAIL_URL,
+                params={'hcno': hcno},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                logger.debug(f"详情页请求失败: hcno={hcno}, status={resp.status_code}")
+                return 0, 0
+
+            html = resp.text
+            soup = BeautifulSoup(html, 'lxml')
+
+            # 检查预览按钮
+            ck_btn = soup.find('button', class_='ck_btn')
+            allow_preview = 1 if ck_btn else 0
+
+            # 检查下载按钮
+            xz_btn = soup.find('button', class_='xz_btn')
+            allow_download = 1 if xz_btn else 0
+
+            return allow_download, allow_preview
+
+        except Exception as e:
+            logger.warning(f"检测可用性异常: hcno={hcno}, {e}")
+            return 0, 0
+
+    def check_availability(self, std_type_code=None):
+        """批量检测标准的可用性（下载/预览权限）
+
+        从数据库中获取未检测的标准，逐一访问详情页判断权限，
+        并更新数据库中的 allow_download, allow_preview, allow_checked 字段。
+
+        Args:
+            std_type_code: 标准类型代码（可选），1=强制性, 2=推荐性, 3=指导性
+        """
+        if std_type_code:
+            std_type = STD_TYPES.get(std_type_code, '')
+            unchecked = self.db.get_unchecked_standards(std_type=std_type)
+        else:
+            unchecked = self.db.get_unchecked_standards()
+
+        total = len(unchecked)
+        logger.info(f"待检测可用性标准: {total} 个")
+
+        if total == 0:
+            logger.info("没有待检测的标准")
+            return
+
+        checked = 0
+        dl_count = 0
+        pv_count = 0
+
+        try:
+            for i, row in enumerate(unchecked):
+                if self._interrupted:
+                    logger.info("检测到中断信号，停止可用性检测")
+                    break
+
+                standard_no = row[0]
+                hcno = row[1]
+
+                self._check_delay()
+
+                allow_download, allow_preview = self._check_detail_availability(hcno)
+
+                # 更新数据库
+                self.db.update_allow_flags(standard_no, allow_download, allow_preview)
+                self.db.update_allow_checked(standard_no)
+
+                checked += 1
+                if allow_download:
+                    dl_count += 1
+                if allow_preview:
+                    pv_count += 1
+
+                if (i + 1) % 100 == 0:
+                    logger.info(f"检测进度: {i+1}/{total}, 可下载={dl_count}, 可预览={pv_count}")
+
+                logger.debug(f"检测: {standard_no} -> 下载={'是' if allow_download else '否'}, "
+                             f"预览={'是' if allow_preview else '否'}")
+
+        except CrawlInterrupted:
+            logger.info(f"用户中断可用性检测，已检测 {checked}/{total}")
+
+        except KeyboardInterrupt:
+            self._interrupted = True
+            logger.info(f"用户中断可用性检测 (Ctrl+C)，已检测 {checked}/{total}")
+
+        logger.info(f"可用性检测完成: 共检测 {checked} 个, 可下载 {dl_count}, 可预览 {pv_count}")
+
+    # ==================== 下载相关 ====================
+
     def _safe_filename(self, standard_no, standard_name):
         safe_name = re.sub(r'[\\/:*?"<>|\r\n\t]', '_', standard_name)
         safe_no = re.sub(r'[\\/:*?"<>|\r\n\t]', '_', standard_no)
@@ -468,72 +686,42 @@ class GBCrawler:
             safe_name = safe_name[:150]
         return f"{safe_no}-{safe_name}.pdf"
 
-    def _check_detail_page(self, hcno):
-        """检查详情页，判断标准是否允许下载/预览
+    def _init_download_session(self):
+        """初始化下载会话：建立与 c.gb688.cn 的 HTTP 会话
 
-        注意：openstd.samr.gov.cn 详情页需要JS渲染，requests可能无法正确获取页面内容。
-        如果详情页返回"尚未收录"，不应直接判定为不可下载，而是返回未知状态，
-        由下载流程(c.gb688.cn)来实际判断。
-
-        Returns:
-            tuple: (allow_download: bool, allow_preview: bool, standard_not_found: bool)
+        c.gb688.cn 需要先建立会话获取 JSESSIONID Cookie。
+        访问 /bzgk/gb/index 端点即可触发服务器设置 Cookie。
+        如果 index 端点不可用，则回退到验证码端点。
+        requests.Session 会自动管理 Cookie，无需手动提取。
         """
+        dl_session = self._get_dl_session()
         try:
-            resp = self.session.get(
-                DETAIL_URL,
-                params={'hcno': hcno},
-                timeout=30,
-                headers={
-                    'Referer': BASE_URL + '/bzgk/std/',
-                }
+            resp = dl_session.get(
+                GB688_BASE + '/index',
+                timeout=15,
+                allow_redirects=True,
             )
-            resp.encoding = 'utf-8'
-            if resp.status_code != 200:
-                logger.warning(f"详情页请求失败: status={resp.status_code}, hcno={hcno}")
-                # 无法确认，返回全部允许，由下载流程判断
-                return True, True, False
-
-            html = resp.text
-
-            # 标准未收录 - 但由于requests无法获取JS渲染后的页面，
-            # 该判断可能不可靠。仍返回not_found让下载流程去验证。
-            if '您所查询的标准系统尚未收录' in html:
-                # 检查页面上是否有按钮区域（说明JS未渲染但标准可能存在）
-                # 如果页面确实没有标准信息，才返回not_found
-                if 'xz_btn' not in html and 'ck_btn' not in html:
-                    # 页面中没有下载/预览按钮的原始HTML，可能标准确实未收录
-                    # 但也可能是因为JS未执行。保守起见，仍尝试下载
-                    logger.debug(f"详情页显示未收录(可能是JS未渲染): hcno={hcno}")
-                    # 不返回not_found，让下载流程去c.gb688.cn验证
-                    return True, True, False
-
-            soup = BeautifulSoup(html, 'lxml')
-
-            # 检查下载按钮
-            xz_btn = soup.select_one('button.xz_btn')
-            allow_download = xz_btn is not None
-
-            # 检查预览按钮
-            ck_btn = soup.select_one('button.ck_btn')
-            allow_preview = ck_btn is not None
-
-            # 如果都无法检测到，默认都允许尝试（由下载服务器判断）
-            if not allow_download and not allow_preview:
-                logger.debug(f"详情页未检测到按钮(可能是JS未渲染): hcno={hcno}")
-                return True, True, False
-
-            return allow_download, allow_preview, False
-
+            logger.debug(f"下载会话初始化: status={resp.status_code}")
         except Exception as e:
-            logger.warning(f"检查详情页失败: hcno={hcno}, error={e}")
-            # 出错时保守处理，允许尝试下载
-            return True, True, False
+            logger.debug(f"下载会话初始化(index)失败: {e}, 尝试验证码端点")
+            try:
+                resp = dl_session.get(
+                    f"{CAPTCHA_URL}?_{int(time.time() * 1000)}",
+                    timeout=15,
+                )
+                logger.debug(f"下载会话初始化(captcha): status={resp.status_code}")
+            except Exception as e2:
+                logger.warning(f"下载会话初始化失败: {e2}")
 
-    def _solve_captcha(self):
+    def _solve_captcha(self, hcno='', download_type='download'):
         """解决验证码：获取验证码图片 -> OCR识别 -> 提交验证
-        
+
         验证码和下载必须在同一HTTP会话中完成，因此使用 _dl_session
-        
+
+        Args:
+            hcno: 标准唯一标识哈希（用于构造正确的Referer）
+            download_type: 下载类型 ('download' 或 'online')
+
         Returns:
             bool: 验证码是否通过
         """
@@ -565,7 +753,7 @@ class GBCrawler:
                     },
                     headers={
                         'Content-Type': 'application/x-www-form-urlencoded',
-                        'Referer': f'{SHOW_GB_URL}?type=download&hcno=',
+                        'Referer': f'{SHOW_GB_URL}?type={download_type}&hcno={hcno}',
                         'Origin': 'http://c.gb688.cn',
                     },
                     timeout=15
@@ -588,10 +776,10 @@ class GBCrawler:
 
     def _download_pdf_direct(self, hcno, filepath):
         """方式一：直接下载PDF（标准允许下载时使用）
-        
+
         调用 viewGb 接口直接获取PDF文件流
         需要先通过验证码验证（同一会话）
-        
+
         Returns:
             bool: 是否下载成功
         """
@@ -643,15 +831,25 @@ class GBCrawler:
 
     def _parse_preview_pages(self, html_text):
         """解析预览页面结构，提取页面和图块信息
-        
+
+        预览页面结构:
+        - div#viewer > div.page 每页一个div
+        - div.page 的 bg 属性包含图片URL: "viewGbImg?fileName=ENCRYPTED%2BString%3D"
+        - div.page 的 style 包含 width 和 height
+        - 每个 span[class^="pdfImg"] 是一个图块:
+          - class="pdfImg-{col}-{row}" 表示图块的目标位置（第col列、第row行）
+          - style="background-position: -Xpx -Ypx" 表示图块在源图中的偏移
+
         Returns:
             list[dict]: 页面结构列表，每个元素包含:
                 - no: 页码
-                - img_id: 图片资源ID
+                - img_id: 图片文件名（仅fileName参数值，已URL解码）
                 - w: 页面宽度
                 - h: 页面高度
                 - blocks: 图块列表 [{x, y, img_x, img_y}, ...]
         """
+        import urllib.parse
+
         soup = BeautifulSoup(html_text, 'lxml')
         pages = []
 
@@ -659,27 +857,54 @@ class GBCrawler:
             blocks = []
             for block_span in page_div.select('span[class^="pdfImg"]'):
                 class_parts = block_span['class'][0].split('-')
-                _, block_x, block_y = class_parts
+                if len(class_parts) < 3:
+                    continue
+                _, block_x, block_y = class_parts[0], class_parts[1], class_parts[2]
                 style = block_span.get('style', '')
-                match = re.search(r"background-position:\s*-(\d+)px\s+-(\d+)px", style)
+                # background-position 可能为负值: "-360px -169px" 或 "0px 0px"
+                match = re.search(r"background-position:\s*(-?\d+)px\s+(-?\d+)px", style)
                 if match:
                     blocks.append({
                         'x': int(block_x),
                         'y': int(block_y),
-                        'img_x': int(match.group(1)),
-                        'img_y': int(match.group(2)),
+                        'img_x': abs(int(match.group(1))),
+                        'img_y': abs(int(match.group(2))),
                     })
 
             blocks.sort(key=lambda b: (b['y'], b['x']))
 
-            import urllib.parse
+            # 从bg属性提取图片文件名
+            # bg值形如: "viewGbImg?fileName=LtD10kkUv5fcSz%2B0onLko3ONnBTAH2e4aHP%2F1FxI9bM%3D"
+            # 需要提取 fileName 参数的值并URL解码
+            bg_raw = page_div.get('bg', '')
+            img_file_name = ''
+            if bg_raw:
+                # 方法1: 从查询参数中提取fileName
+                if 'fileName=' in bg_raw:
+                    file_name_encoded = bg_raw.split('fileName=', 1)[1].split('&')[0]
+                    img_file_name = urllib.parse.unquote(file_name_encoded)
+                else:
+                    # bg属性可能直接是文件名
+                    img_file_name = urllib.parse.unquote(bg_raw)
+            else:
+                # 方法2: 从第一个span的background-image CSS中提取
+                first_span = page_div.find('span')
+                if first_span:
+                    span_style = first_span.get('style', '')
+                    bg_img_match = re.search(r'background-image:\s*url\(["\']?([^"\')]+)["\']?\)', span_style)
+                    if bg_img_match:
+                        bg_url = bg_img_match.group(1)
+                        if 'fileName=' in bg_url:
+                            file_name_encoded = bg_url.split('fileName=', 1)[1].split('&')[0]
+                            img_file_name = urllib.parse.unquote(file_name_encoded)
+
             style = page_div.get('style', '')
             w_match = re.search(r'width:\s*(\d+)px', style)
             h_match = re.search(r'height:\s*(\d+)px', style)
 
             pages.append({
                 'no': int(page_div.get('id', 0)),
-                'img_id': urllib.parse.unquote(page_div.get('bg', '')),
+                'img_id': img_file_name,
                 'w': int(w_match.group(1)) if w_match else 0,
                 'h': int(h_match.group(1)) if h_match else 0,
                 'blocks': blocks,
@@ -687,11 +912,14 @@ class GBCrawler:
 
         return pages
 
-    def _download_preview_image(self, img_id):
+    def _download_preview_image(self, img_id, hcno=''):
         """下载预览图片资源
-        
+
+        img_id 是从 bg 属性中提取的 fileName 参数值（已URL解码），
+        requests 库会自动对 params 值进行 URL 编码，无需手动编码。
+
         Returns:
-            bytes: 图片数据（WebP格式）
+            bytes: 图片数据（WebP/PNG格式）
         """
         dl_session = self._get_dl_session()
         resp = dl_session.get(
@@ -699,7 +927,7 @@ class GBCrawler:
             params={'fileName': img_id},
             headers={
                 'Cache-Alive': 'chunked',
-                'Referer': f'{SHOW_GB_URL}?type=online',
+                'Referer': f'{SHOW_GB_URL}?type=online&hcno={hcno}',
             },
             timeout=60,
             allow_redirects=True,
@@ -707,27 +935,36 @@ class GBCrawler:
         resp.raise_for_status()
         return resp.content
 
-    def _reorganize_page(self, page_info, raw_img_path, output_img_path):
+    def _reorganize_page(self, page_info, raw_img_data, output_img_path):
         """重组页面：将打乱的图块重新拼接为完整页面
-        
+
         预览页面将每一页分成10x10的网格，图块被随机打乱排列。
         需要根据每个图块的(x,y)位置和(img_x,img_y)偏移重新拼接。
+
+        Args:
+            page_info: 页面结构信息
+            raw_img_data: 原始图片二进制数据（WebP/PNG格式）
+            output_img_path: 输出页面图片路径
         """
         import cv2
         import numpy as np
 
-        # 读取原始图片（含透明通道）
-        raw_img = cv2.imread(str(raw_img_path), cv2.IMREAD_UNCHANGED)
+        # 使用 cv2.imdecode 从内存中读取图片，避免文件扩展名问题（图片可能是WebP或PNG）
+        img_array = np.frombuffer(raw_img_data, np.uint8)
+        raw_img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
         if raw_img is None:
-            logger.error(f"无法读取图片: {raw_img_path}")
+            logger.error(f"无法解码图片数据: size={len(raw_img_data)}")
             return False
 
         # 透明图层加白背景
-        if raw_img.shape[2] == 4:
+        if len(raw_img.shape) == 3 and raw_img.shape[2] == 4:
             bg = np.full((*raw_img.shape[:2], 3), 255, np.uint8)
             alpha = raw_img[:, :, 3].astype(float) / 255.0
             alpha = np.expand_dims(alpha, axis=-1)
             raw_img = (raw_img[:, :, :3] * alpha + bg * (1 - alpha)).astype(np.uint8)
+        elif len(raw_img.shape) == 2:
+            # 灰度图转RGB
+            raw_img = cv2.cvtColor(raw_img, cv2.COLOR_GRAY2RGB)
 
         page_w = page_info['w']
         page_h = page_info['h']
@@ -794,13 +1031,13 @@ class GBCrawler:
 
     def _download_pdf_preview(self, hcno, filepath):
         """方式二：预览方式下载PDF（标准仅允许预览时使用）
-        
+
         流程：
         1. 获取预览页面结构（showGb?type=online）
-        2. 下载所有原始图片资源（viewGbImg）
-        3. 重组页面（图块拼合）
-        4. 生成PDF
-        
+        2. 下载所有原始图片资源到内存缓存（viewGbImg）
+        3. 重组页面（图块拼合，使用内存缓存）
+        4. 生成PDF（仅临时目录用于页面PNG和最终PDF）
+
         Returns:
             bool: 是否下载成功
         """
@@ -821,32 +1058,73 @@ class GBCrawler:
                 logger.warning(f"预览页面请求失败: status={resp.status_code}")
                 return False
 
-            page_infos = self._parse_preview_pages(resp.text)
+            html = resp.text
+
+            # 诊断日志：检查页面是否包含预览结构
+            has_viewer = 'div id="viewer"' in html or "div id='viewer'" in html or 'id="viewer"' in html
+            has_page = 'class="page"' in html
+            has_pdf_img = 'pdfImg' in html
+            logger.debug(f"预览页面诊断: len={len(html)}, has_viewer={has_viewer}, "
+                         f"has_page={has_page}, has_pdfImg={has_pdf_img}")
+
+            if not has_viewer and not has_page:
+                # 页面可能未正确加载（需要验证码先验证）
+                # 或者页面返回了错误信息
+                if '尚未收录' in html and 'pdfImg' not in html:
+                    logger.warning(f"预览页面显示\"尚未收录\": hcno={hcno}")
+                    return False
+                if 'verifyCode' in html or 'gc?' in html:
+                    logger.warning(f"预览页面需要验证码验证: hcno={hcno}")
+                    return False
+                # 可能是JS动态加载的页面，无法用requests获取
+                logger.warning(f"预览页面缺少viewer结构: hcno={hcno}, html_len={len(html)}")
+                # 输出部分HTML以便调试
+                logger.debug(f"预览页面前2000字符: {html[:2000]}")
+                return False
+
+            page_infos = self._parse_preview_pages(html)
             if not page_infos:
-                logger.warning(f"预览页面解析失败: hcno={hcno}")
+                logger.warning(f"预览页面解析失败（无page元素）: hcno={hcno}")
                 return False
 
             logger.debug(f"预览页面解析成功: {len(page_infos)} 页")
 
-            # 收集唯一的图片ID
+            # 收集唯一的图片ID（多页可能共享同一张图片）
             img_ids = set(p['img_id'] for p in page_infos if p['img_id'])
+            logger.debug(f"预览图片: {len(img_ids)} 张唯一图片, {len(page_infos)} 页")
 
-            # 2. 使用临时目录下载图片和重组
+            # 2. 下载所有唯一的图片并缓存到内存（不写临时文件）
+            img_cache = {}  # img_id -> raw image bytes
+            for img_id in img_ids:
+                try:
+                    img_data = self._download_preview_image(img_id, hcno)
+                    img_cache[img_id] = img_data
+                    logger.debug(f"已下载图片: {img_id[:30]}... ({len(img_data)} bytes)")
+                except Exception as e:
+                    logger.warning(f"图片下载失败: {img_id[:30]}..., {e}")
+
+            if not img_cache:
+                logger.error(f"所有图片下载失败: hcno={hcno}")
+                return False
+
+            # 3. 使用临时目录重组页面（仅用于页面PNG文件和最终PDF）
             with tempfile.TemporaryDirectory(prefix='gb_preview_') as tmp_dir:
-                # 下载所有原始图片
-                for img_id in img_ids:
-                    img_data = self._download_preview_image(img_id)
-                    img_filename = img_id.replace('/', '_')
-                    raw_file = os.path.join(tmp_dir, f"{img_filename}.webp")
-                    with open(raw_file, 'wb') as f:
-                        f.write(img_data)
-
-                # 3. 重组每一页
+                success_pages = 0
                 for page_info in page_infos:
-                    img_filename = page_info['img_id'].replace('/', '_')
-                    raw_file = os.path.join(tmp_dir, f"{img_filename}.webp")
+                    img_id = page_info['img_id']
+                    if img_id not in img_cache:
+                        logger.warning(f"页面图片未下载: 第{page_info['no']}页, {img_id[:30]}...")
+                        continue
                     page_file = os.path.join(tmp_dir, f"P_{page_info['no']}.png")
-                    self._reorganize_page(page_info, raw_file, page_file)
+                    if self._reorganize_page(page_info, img_cache[img_id], page_file):
+                        success_pages += 1
+                    else:
+                        logger.warning(f"页面重组失败: 第{page_info['no']}页")
+
+                if success_pages == 0:
+                    logger.error(f"所有页面重组失败: hcno={hcno}")
+                    return False
+                logger.debug(f"页面重组完成: {success_pages}/{len(page_infos)} 页成功")
 
                 # 4. 渲染PDF
                 self._render_pdf(page_infos, tmp_dir, filepath)
@@ -886,16 +1164,22 @@ class GBCrawler:
             logger.error(f"下载服务器连通性测试异常: {e}")
             return False
 
-    def download_pdf(self, hcno, standard_no, standard_name):
+    def download_pdf(self, hcno, standard_no, standard_name, allow_download=1, allow_preview=1):
         """下载国标PDF文件
-        
+
         下载流程：
-        1. 检查详情页，判断标准是否允许下载/预览
-        2. 解决验证码（同一会话）
-        3. 优先直接下载(viewGb)，不允许下载则尝试预览方式
-        
+        1. 根据 allow_download 标志：重置会话 → 初始化会话 → 解决验证码 → 尝试直接下载(viewGb)
+        2. 根据 allow_preview 标志：重置会话 → 初始化会话 → 解决验证码 → 尝试预览方式下载(showGb+重组)
+
+        Args:
+            hcno: 标准唯一标识哈希
+            standard_no: 标准号
+            standard_name: 标准名称
+            allow_download: 是否允许直接下载（1=允许，0=不允许）
+            allow_preview: 是否允许在线预览（1=允许，0=不允许）
+
         Returns:
-            str: 下载结果 ('success', 'not_found', 'not_downloadable', 'captcha_failed', 'failed')
+            str: 下载结果 ('success', 'captcha_failed', 'failed', 'no_access')
         """
         filename = self._safe_filename(standard_no, standard_name)
         filepath = os.path.join(DOWNLOAD_DIR, filename)
@@ -906,47 +1190,35 @@ class GBCrawler:
             self.db.update_local_file(standard_no, filename)
             return 'success'
 
-        # 1. 检查详情页
-        allow_download, allow_preview, not_found = self._check_detail_page(hcno)
-
-        if not_found:
-            logger.info(f"标准未收录: {standard_no}")
-            self.db.update_allow_flags(standard_no, 0, 0)
-            return 'not_found'
-
-        # 更新数据库中的下载/预览标志
-        self.db.update_allow_flags(standard_no, int(allow_download), int(allow_preview))
-
+        # 无下载权限也无预览权限，跳过
         if not allow_download and not allow_preview:
-            logger.info(f"标准不可下载也不可预览: {standard_no}")
-            return 'not_downloadable'
+            logger.debug(f"标准无下载/预览权限: {standard_no}")
+            return 'no_access'
 
-        # 2. 解决验证码（每次下载重置会话，确保验证码状态干净）
-        self._reset_dl_session()
-        if not self._solve_captcha():
-            logger.warning(f"验证码验证失败: {standard_no}")
-            return 'captcha_failed'
-
-        # 3. 尝试下载
+        # 方式一：允许直接下载
         if allow_download:
-            # 优先直接下载
+            # 每次下载重置会话，确保状态干净
+            self._reset_dl_session()
+            # 初始化会话（获取JSESSIONID）
+            self._init_download_session()
+            if not self._solve_captcha(hcno, 'download'):
+                logger.warning(f"验证码验证失败: {standard_no}")
+                return 'captcha_failed'
+
             if self._download_pdf_direct(hcno, filepath):
                 logger.info(f"下载成功(直接): {filename}")
                 self.db.update_local_file(standard_no, filename)
                 return 'success'
-
-        if allow_preview:
-            # 预览方式下载
-            # 如果直接下载失败，可能需要重新解决验证码
-            if not allow_download:
-                # 之前没尝试直接下载，验证码应该还有效
-                pass
             else:
-                # 直接下载失败了，可能需要重新验证
-                self._reset_dl_session()
-                if not self._solve_captcha():
-                    logger.warning(f"预览下载前验证码验证失败: {standard_no}")
-                    return 'captcha_failed'
+                logger.debug(f"直接下载失败: {standard_no}")
+
+        # 方式二：预览方式下载（仅允许预览 或 直接下载失败时）
+        if allow_preview:
+            self._reset_dl_session()
+            self._init_download_session()
+            if not self._solve_captcha(hcno, 'online'):
+                logger.warning(f"预览下载前验证码验证失败: {standard_no}")
+                return 'captcha_failed'
 
             if self._download_pdf_preview(hcno, filepath):
                 logger.info(f"下载成功(预览): {filename}")
@@ -960,10 +1232,26 @@ class GBCrawler:
 
         return 'failed'
 
-    def download_all(self):
-        pending = self.db.get_pending_downloads()
+    def download_all(self, include_preview=False):
+        """批量下载所有可下载的标准PDF
+
+        Args:
+            include_preview: 是否包含仅允许预览的标准。
+                False(默认): 仅下载 allow_download=1 的标准（直接下载）
+                True: 也尝试下载仅 allow_preview=1 的标准（预览重组方式）
+        """
+        pending = self.db.get_downloadable_standards(include_preview=include_preview)
         total = len(pending)
-        logger.info(f"待下载标准: {total} 个")
+
+        # 统计下载模式
+        dl_only = sum(1 for row in pending if row[2] == 1 and row[3] == 0)
+        pv_only = sum(1 for row in pending if row[2] == 0 and row[3] == 1)
+        both = sum(1 for row in pending if row[2] == 1 and row[3] == 1)
+
+        logger.info(f"待下载标准: {total} 个 (仅可下载: {dl_only}, 仅可预览: {pv_only}, "
+                     f"下载+预览: {both})")
+        if not include_preview:
+            logger.info("下载模式: 仅可下载标准 (使用 --include-preview 可包含仅可预览标准)")
 
         if total == 0:
             logger.info("没有待下载的标准")
@@ -990,8 +1278,6 @@ class GBCrawler:
         success = 0
         failed = 0
         skipped = 0
-        not_found = 0
-        not_downloadable = 0
         captcha_failed = 0
         consecutive_fails = 0
         interrupted = False
@@ -1003,6 +1289,8 @@ class GBCrawler:
 
             standard_no = row[0]
             hcno = row[1]
+            allow_download = row[2]
+            allow_preview = row[3]
 
             if not hcno:
                 skipped += 1
@@ -1025,10 +1313,16 @@ class GBCrawler:
             result = cursor.fetchone()
             standard_name = result[0] if result else standard_no
 
-            logger.info(f"下载进度: {i+1}/{total} - {standard_no} {standard_name[:30]}")
+            # 显示下载模式
+            mode = '直接下载' if allow_download else '预览下载'
+            logger.info(f"下载进度: {i+1}/{total} [{mode}] - {standard_no} {standard_name[:30]}")
 
             try:
-                result = self.download_pdf(hcno, standard_no, standard_name)
+                result = self.download_pdf(
+                    hcno, standard_no, standard_name,
+                    allow_download=allow_download,
+                    allow_preview=allow_preview,
+                )
             except CrawlInterrupted:
                 logger.info("用户中断下载，已保存进度")
                 interrupted = True
@@ -1038,18 +1332,12 @@ class GBCrawler:
                 success += 1
                 consecutive_fails = 0
                 self.db.mark_download_status(standard_no, hcno, 'success')
-            elif result == 'not_found':
-                not_found += 1
-                consecutive_fails = 0
-                self.db.mark_download_status(standard_no, hcno, 'not_found')
-            elif result == 'not_downloadable':
-                not_downloadable += 1
-                consecutive_fails = 0
-                self.db.mark_download_status(standard_no, hcno, 'not_downloadable')
             elif result == 'captcha_failed':
                 captcha_failed += 1
                 consecutive_fails += 1
                 self.db.mark_download_status(standard_no, hcno, 'captcha_failed', retries + 1)
+            elif result == 'no_access':
+                skipped += 1
             else:
                 failed += 1
                 consecutive_fails += 1
@@ -1057,7 +1345,6 @@ class GBCrawler:
 
             if (i + 1) % 50 == 0:
                 logger.info(f"=== 进度: {i+1}/{total}, 成功={success}, 失败={failed}, "
-                            f"未收录={not_found}, 不可下载={not_downloadable}, "
                             f"验证码失败={captcha_failed}, 跳过={skipped} ===")
 
             # 每次下载后适当延时
@@ -1065,13 +1352,13 @@ class GBCrawler:
 
         if interrupted and consecutive_fails >= CONSECUTIVE_FAIL_LIMIT:
             logger.info(f"下载已终止(连续失败): 成功 {success}, 失败 {failed}, "
-                        f"未收录 {not_found}, 不可下载 {not_downloadable}, 跳过 {skipped}")
+                        f"验证码失败 {captcha_failed}, 跳过 {skipped}")
         elif interrupted:
             logger.info(f"下载已中断: 成功 {success}, 失败 {failed}, "
-                        f"未收录 {not_found}, 不可下载 {not_downloadable}, 跳过 {skipped}")
+                        f"验证码失败 {captcha_failed}, 跳过 {skipped}")
         else:
             logger.info(f"下载完成: 成功 {success}, 失败 {failed}, "
-                        f"未收录 {not_found}, 不可下载 {not_downloadable}, 跳过 {skipped}")
+                        f"验证码失败 {captcha_failed}, 跳过 {skipped}")
 
     def request_stop(self):
         """请求优雅停止，会在当前任务完成后退出"""
@@ -1086,9 +1373,12 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='国家标准爬虫')
     parser.add_argument('--crawl', action='store_true', help='爬取标准列表')
+    parser.add_argument('--check', action='store_true', help='检测标准可用性（下载/预览权限）')
     parser.add_argument('--download', action='store_true', help='下载标准PDF')
     parser.add_argument('--type', type=int, choices=[1, 2, 3], help='标准类型: 1=强制性, 2=推荐性, 3=指导性')
-    parser.add_argument('--all', action='store_true', help='执行全部操作（爬取+下载）')
+    parser.add_argument('--include-preview', action='store_true',
+                        help='下载时包含仅可预览的标准（默认仅下载可直接下载的标准）')
+    parser.add_argument('--all', action='store_true', help='执行全部操作（爬取+检测+下载）')
     parser.add_argument('--stats', action='store_true', help='显示统计信息')
     args = parser.parse_args()
 
@@ -1098,11 +1388,14 @@ def main():
             crawler.db.get_stats()
         elif args.all:
             crawler.crawl_list(args.type)
-            crawler.download_all()
+            crawler.check_availability(args.type)
+            crawler.download_all(include_preview=args.include_preview)
         elif args.crawl:
             crawler.crawl_list(args.type)
+        elif args.check:
+            crawler.check_availability(args.type)
         elif args.download:
-            crawler.download_all()
+            crawler.download_all(include_preview=args.include_preview)
         else:
             parser.print_help()
     except KeyboardInterrupt:
