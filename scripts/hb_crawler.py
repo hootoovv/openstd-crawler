@@ -360,9 +360,17 @@ class HBCrawler:
     def _safe_filename(self, standard_no, standard_name):
         safe_name = re.sub(r'[\\/:*?"<>|\r\n\t]', '_', standard_name)
         safe_no = re.sub(r'[\\/:*?"<>|\r\n\t]', '_', standard_no)
-        if len(safe_name) > 150:
-            safe_name = safe_name[:150]
-        return f"{safe_no}-{safe_name}.pdf"
+        # 文件系统单文件名限制255字节，中文占3字节，需按字节截断
+        # 预留 safe_no + '-' + '.pdf' 的字节数
+        prefix = f"{safe_no}-"
+        suffix = ".pdf"
+        max_name_bytes = 255 - len(prefix.encode('utf-8')) - len(suffix.encode('utf-8'))
+        name_bytes = safe_name.encode('utf-8')
+        if len(name_bytes) > max_name_bytes:
+            # 按字节截断，避免截断在多字节字符中间
+            safe_name = name_bytes[:max_name_bytes].decode('utf-8', errors='ignore')
+        return f"{prefix}{safe_name}{suffix}"
+
 
     def _check_public(self, pk):
         try:

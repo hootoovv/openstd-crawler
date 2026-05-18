@@ -31,6 +31,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+convert = [
+    "mineru>=3.0.0",
+]
 dev = [
     "ruff>=0.4.0",
 ]
